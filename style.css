@@ -1,0 +1,39 @@
+.faceswap-settings .fs-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.faceswap-settings .fs-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 10px;
+    margin: 6px 0;
+}
+
+.faceswap-settings .fs-preview {
+    max-width: 120px;
+    max-height: 120px;
+    border-radius: 8px;
+    margin: 6px 0;
+    object-fit: cover;
+}
+
+.faceswap-settings label {
+    display: block;
+    margin-top: 6px;
+}
+
+.faceswap-settings .checkbox_label {
+    display: flex;
+}
+
+.faceswap-settings .fs-status {
+    display: block;
+    opacity: 0.75;
+    margin: 4px 0 2px;
+}
+
+.faceswap-settings #fs_predownload {
+    margin-top: 6px;
+}
