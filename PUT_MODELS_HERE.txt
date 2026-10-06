@@ -1,0 +1,4 @@
+No manual step needed anymore.
+Open the Face Swap settings and click "Download models" once.
+Files are cached in the browser (nothing kept in memory).
+This folder is only a local override / offline fallback.
