@@ -77,5 +77,6 @@ again starts from the untouched original, not from an already-swapped one.
 | "No face found" on a chat image | The face may be too small or turned away |
 | "Download failed" | Check your internet, then click **Download models** again |
 | Everything is slow or crashes | Turn off **Light face enhance**, or use **WASM only** |
+| "ceil() in shape computation" error | Switch **Runtime** to **WASM only** (the extension also does this by itself and retries) |
 
 Enjoy!

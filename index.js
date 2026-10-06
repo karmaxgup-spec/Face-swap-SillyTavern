@@ -162,7 +162,8 @@ const smoothstep = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1);
 function toCanvas(img) {
     const c = document.createElement('canvas');
     c.width = img.width; c.height = img.height;
-    c.getContext('2d').putImageData(img, 0, 0);
+    const id = img instanceof ImageData ? img : new ImageData(new Uint8ClampedArray(img.data), img.width, img.height);
+    c.getContext('2d').putImageData(id, 0, 0);
     return c;
 }
 
@@ -265,13 +266,14 @@ function paste(dst, crop, size, M, maskFn, weight = 1) {
 
 const ellipseMask = (inner, outer) => (u, v) => 1 - smoothstep(inner, outer, Math.hypot((u - 0.5) * 2, (v - 0.5) * 2));
 
-function toNCHW(img, mean, std) {
+function toNCHW(img, mean, std, swapRB = false) {
     const { data, width: w, height: h } = img;
     const n = w * h, f = new Float32Array(3 * n);
+    const ro = swapRB ? 2 : 0, bo = swapRB ? 0 : 2;
     for (let i = 0; i < n; i++) {
-        f[i] = (data[i * 4] - mean) / std;
+        f[i] = (data[i * 4 + ro] - mean) / std;
         f[n + i] = (data[i * 4 + 1] - mean) / std;
-        f[2 * n + i] = (data[i * 4 + 2] - mean) / std;
+        f[2 * n + i] = (data[i * 4 + bo] - mean) / std;
     }
     return f;
 }
@@ -352,8 +354,71 @@ function iou(a, b) {
     return inter / ua;
 }
 
-async function detect(session, ort, img, minFace) {
-    const SZ = 640, scale = Math.min(SZ / img.width, SZ / img.height);
+// SCRFD exports order their 9 outputs differently (grouped by type, by stride,
+// or renamed entirely). Build every plausible interpretation, score each by how
+// many anchors pass the detection threshold, and decode with the winner — no
+// extra model runs, just cheap passes over small arrays.
+function pickDetectorHeads(session, outs, SZ) {
+    const names = session.outputNames;
+    const describe = () => names.map((n) => `${n}[${(outs[n].dims || []).join('x')}]`).join(', ');
+    const STRIDES = [8, 16, 32];
+    const cands = [];
+    if (names.length >= 9) {
+        cands.push({ kind: 'by-type', heads: STRIDES.map((s, i) => ({ sc: outs[names[i]]?.data, bb: outs[names[i + 3]]?.data, kp: outs[names[i + 6]]?.data, stride: s })) });
+        cands.push({ kind: 'by-stride', heads: STRIDES.map((s, i) => ({ sc: outs[names[i * 3]]?.data, bb: outs[names[i * 3 + 1]]?.data, kp: outs[names[i * 3 + 2]]?.data, stride: s })) });
+    }
+    // By name, e.g. score_8 / bbox_16 / kps_32.
+    {
+        const slot = {};
+        for (const n of names) {
+            const t = /score|conf|cls|prob/i.test(n) ? 'sc' : /bbox|box|loc/i.test(n) ? 'bb' : /kps|kpt|keypoint|landmark/i.test(n) ? 'kp' : null;
+            const m = /([^0-9]|^)(8|16|32)([^0-9]|$)/.exec(n);
+            if (t && m) slot[`${t}_${m[2]}`] = outs[n].data;
+        }
+        const heads = STRIDES.map((s) => (slot[`sc_${s}`] && slot[`bb_${s}`] && slot[`kp_${s}`]
+            ? { sc: slot[`sc_${s}`], bb: slot[`bb_${s}`], kp: slot[`kp_${s}`], stride: s } : null));
+        if (heads.every(Boolean)) cands.push({ kind: 'by-name', heads });
+    }
+    // By shape: last dim 1/4/10 identifies the type, anchor count the stride.
+    {
+        const pool = names.map((n) => ({ data: outs[n].data, dims: outs[n].dims || [], used: false }));
+        const take = (C, s) => {
+            const A = 2 * (SZ / s) * (SZ / s);
+            const hit = pool.find((o) => !o.used && o.data.length === A * C
+                && (o.dims.length < 2 || o.dims[o.dims.length - 1] === C));
+            if (!hit) return null;
+            hit.used = true;
+            return hit.data;
+        };
+        const heads = [];
+        let ok = true;
+        for (const s of STRIDES) {
+            const kp = take(10, s), bb = take(4, s), sc = take(1, s);
+            if (!sc || !bb || !kp) { ok = false; break; }
+            heads.push({ sc, bb, kp, stride: s });
+        }
+        if (ok) cands.push({ kind: 'by-shape', heads });
+    }
+    // Drop interpretations whose tensor sizes are mutually inconsistent…
+    const valid = cands.filter((c) => c.heads.every((h) => h.sc && h.bb && h.kp
+        && h.sc.length * 4 === h.bb.length && h.sc.length * 10 === h.kp.length));
+    // …then trust the one that actually sees faces.
+    const hits = (c) => c.heads.reduce((n, h) => {
+        for (let k = 0; k < h.sc.length; k++) if (h.sc[k] >= 0.5) n++;
+        return n;
+    }, 0);
+    valid.sort((a, b) => hits(b) - hits(a));
+    const win = valid[0];
+    if (!win) throw new Error(`Unexpected detector outputs (${describe()}). Use SCRFD det_2.5g.onnx from the buffalo_m pack.`);
+    if (!pickDetectorHeads.logged) {
+        pickDetectorHeads.logged = true;
+        console.info(`[FaceSwap] detector outputs: ${describe()} — using ${win.kind} mapping`);
+    }
+    return win.heads;
+}
+
+async function detect(session, ort, img, minFace, SZ = 640) {
+    const scale = Math.min(SZ / img.width, SZ / img.height);
     const nw = Math.round(img.width * scale), nh = Math.round(img.height * scale);
     const c = document.createElement('canvas');
     c.width = c.height = SZ;
@@ -363,14 +428,28 @@ async function detect(session, ort, img, minFace) {
     g.drawImage(toCanvas(img), 0, 0, nw, nh);
     const px = g.getImageData(0, 0, SZ, SZ);
 
-    const input = new ort.Tensor('float32', toNCHW(px, 127.5, 128), [1, 3, SZ, SZ]);
-    const outs = await session.run({ [session.inputNames[0]]: input });
-    const names = session.outputNames;
-    if (names.length < 9) throw new Error(`Unexpected detector outputs (got ${names.length}, need 9). Use SCRFD det_2.5g.onnx from the buffalo_m pack.`);
+    // These models were trained on BGR (OpenCV convention); try RGB first and
+    // fall back to BGR when RGB sees nothing. Costs one extra detector run
+    // only in the failing case, and the log says which one won.
+    const runOnce = async (swapRB) => {
+        const input = new ort.Tensor('float32', toNCHW(px, 127.5, 128, swapRB), [1, 3, SZ, SZ]);
+        const outs = await session.run({ [session.inputNames[0]]: input });
+        const heads = pickDetectorHeads(session, outs, SZ);
+        let top = 0;
+        for (const h of heads) for (let k = 0; k < h.sc.length; k++) if (h.sc[k] > top) top = h.sc[k];
+        return { heads, top };
+    };
+    let { heads, top: best } = await runOnce(false);
+    if (best < 0.5) {
+        const alt = await runOnce(true);
+        if (alt.best > best) {
+            console.info(`[FaceSwap] detector prefers BGR input (RGB best ${best.toFixed(3)}, BGR best ${alt.best.toFixed(3)})`);
+            heads = alt.heads; best = alt.best;
+        }
+    }
 
     const dets = [];
-    [8, 16, 32].forEach((stride, i) => {
-        const sc = outs[names[i]].data, bb = outs[names[i + 3]].data, kp = outs[names[i + 6]].data;
+    for (const { sc, bb, kp, stride } of heads) {
         const fw = SZ / stride;
         for (let k = 0; k < sc.length; k++) {
             if (sc[k] < 0.5) continue;
@@ -387,15 +466,32 @@ async function detect(session, ort, img, minFace) {
                 kps,
             });
         }
-    });
+    }
 
     dets.sort((a, b) => b.score - a.score);
     const keep = [];
     for (const d of dets) if (keep.every((k) => iou(k, d) <= 0.4)) keep.push(d);
     const area = (f) => (f.x2 - f.x1) * (f.y2 - f.y1);
-    return keep
+    const faces = keep
         .filter((f) => Math.min(f.x2 - f.x1, f.y2 - f.y1) >= minFace)
         .sort((a, b) => area(b) - area(a));
+    faces.bestScore = best;
+    return faces;
+}
+
+// A face bigger than the detector's anchor range (~256px at 640 input) is
+// invisible at full size — retry smaller until something is found. detect()
+// returns image-space coords at any SZ, so results need no rescaling.
+async function detectMulti(session, ort, img, minFace) {
+    let best = 0;
+    for (const SZ of [640, 448, 320]) {
+        const faces = await detect(session, ort, img, minFace, SZ);
+        if (faces.bestScore > best) best = faces.bestScore;
+        if (faces.length) return faces;
+    }
+    const empty = [];
+    empty.bestScore = best;
+    return empty;
 }
 
 async function embed(session, ort, crop112) {
@@ -432,6 +528,14 @@ async function swapImage(targetSrc, refSrc, progress) {
     const ort = await loadOrt();
     const target = await loadImage(targetSrc, s.maxSide);
     const ref = await loadImage(refSrc, 1024);
+    // Debug: garbage-in check. A healthy photo has mean channel ~60-180;
+    // ~0/~255 means a blank image reached the model (loading bug, not a model bug).
+    for (const [img, label] of [[ref, 'reference'], [target, 'target']]) {
+        let s = 0, n = 0;
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 40) { s += d[i] + d[i + 1] + d[i + 2]; n += 3; }
+        console.info(`[FaceSwap] ${label}: ${img.width}x${img.height}, mean channel ${(s / n).toFixed(1)}`);
+    }
 
     // 1) detect (reference + target) -> release
     progress('Detecting faces…');
@@ -439,10 +543,10 @@ async function swapImage(targetSrc, refSrc, progress) {
     {
         const det = await openSession(s.detFile);
         try {
-            const r = await detect(det, ort, ref, 0);
-            if (!r.length) throw new Error('No face found in the reference image');
+            const r = await detectMulti(det, ort, ref, 0);
+            if (!r.length) throw new Error(`No face found in the reference image (best detector score ${(r.bestScore ?? 0).toFixed(3)} — extreme close-ups are invisible to the detector; use a photo showing the whole head)`);
             refFace = r[0];
-            const all = await detect(det, ort, target, s.minFace);
+            const all = await detectMulti(det, ort, target, s.minFace);
             faces = s.allFaces ? all : all.slice(0, 1);
         } finally { await det.release(); }
     }
@@ -591,7 +695,18 @@ async function processMessage(id, force = false) {
     } catch (e) {
         console.error('[FaceSwap]', e);
         endProgress();
-        toastr.error(String(e.message ?? e), 'Face swap');
+        const errText = String(e.message ?? e);
+        // onnxruntime-web's WebGPU backend can't build some ops (e.g. ceil-mode
+        // AveragePool in these models). Fall back to WASM once and retry.
+        if (S().provider !== 'wasm' && /ceil|webgpu|AveragePool|not supported|not implemented/i.test(errText)) {
+            S().provider = 'wasm';
+            save();
+            $('#fs_provider').val('wasm');
+            toastr.warning('WebGPU mode hit an unsupported operation. Switched to WASM only, retrying…', 'Face swap');
+            await enqueue(id, force);
+            return;
+        }
+        toastr.error(errText, 'Face swap');
     }
 }
 
@@ -635,6 +750,11 @@ function setPreview() {
 
 async function initSettings() {
     extension_settings[MODULE] = Object.assign({}, defaults, extension_settings[MODULE]);
+    // Migrate saved settings from the old folder name to the current one.
+    if (S().modelsPath === '/scripts/extensions/third-party/ST-FaceSwap/models') {
+        S().modelsPath = `${BASE}/models`;
+        save();
+    }
     const html = await renderExtensionTemplateAsync(`third-party/${FOLDER}`, 'settings');
     $('#extensions_settings2').append(html);
 
